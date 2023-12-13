@@ -1,102 +1,90 @@
-﻿using System;
-using System.Net;
-using System.Threading.Tasks;
-using DocuWare.Platform.ServerClient;
-using DocuWare.Services.Http.Client;
-using DotNetThrottlingExample.classes;
-using DotNetThrottlingExample.interfaces;
-using DotNetThrottlingExample.models;
-using Microsoft.Extensions.Configuration;
+﻿using DocuWare.Platform.ServerClient;
+using DocuWare.Platform.ServerClient.Exceptions;
 using Polly;
+using Polly.Retry;
+using System;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace DotNetThrottlingExample
 {
-    class Program
+    internal class Program
     {
-        // Stores the configuration which includes AppSettings, command line arguments and environment variables
-        public static IConfigurationRoot configuration;
-
-        // Contains the Factory to get the correct throttling strategy.
-        public static ThrottlingStrategyFactory ThrottlingStrategyFactory;
-
-        static async Task Main(string[] args)
+        private static async Task Main(string[] args)
         {
             Console.WriteLine("Hello and Welcome to DocuWares platform throttling example based on polly!");
 
-            string serverName = @"YOUR-COMPANY-NAME.docuware.cloud";
-            string serverAddress = @"https://" + serverName + @"/DocuWare/Platform/";
-            string userName = "USERNAME";
-            string userPassword = "PASSWORD";
-
-            // Build a configuration which includes everything needed to run the application
-            configuration = new ConfigurationBuilder()
-                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                .AddEnvironmentVariables()
-                .AddCommandLine(args)
-                .Build();
-
-            // Get the app settings from the configuration
-            AppSettingsModel appSettings =
-                configuration.Get<AppSettingsModel>();
-
-            // Create a throttling strategy factory which gets all app settings
-            ThrottlingStrategyFactory = new ThrottlingStrategyFactory(appSettings);
+            var serverName = @"YOUR-COMPANY-NAME.docuware.cloud";
+            var serverAddress = @"https://" + serverName + @"/DocuWare/Platform/";
+            var userName = "USERNAME";
+            var userPassword = "PASSWORD";
 
             // Create a polly policy which reacts to the DocuWare platform throttling
-            Policy throttlingPolicy = getPollyThrottlingPolicy();
+            var throttlingPolicy = getPollyThrottlingPolicy();
 
             // Login example which forces the platform to throttle
-            throttlingPolicy.Execute(() => loginDocuWareWithUserNameAndPassword(serverAddress, userName, userPassword));
+            await throttlingPolicy.ExecuteAsync(() => loginDocuWareWithUserNameAndPassword(serverAddress, userName, userPassword));
         }
 
         /// <summary>
-        /// Get a polly throttling policy.
+        ///     Get a async polly throttling policy with use of RetryAfterInterval from the
+        ///     DocuWare.Platform.ServerClient.Exceptions.ClientThrottleException.
         /// </summary>
         /// <returns>A policy which reacts at throttling exceptions.</returns>
-        static Policy getPollyThrottlingPolicy()
+        private static AsyncRetryPolicy getPollyThrottlingPolicy()
         {
             // Create and return a polly throttling policy.
-            return Policy
-                .Handle<HttpClientRequestException>(httpClientRequestException => httpClientRequestException.StatusCode == HttpStatusCode.TooManyRequests)
-                //.Or<Exception>() with that you are able to add multiple exceptions.
-                .WaitAndRetry(retryCount: 5,
-                    sleepDurationProvider: (retryCount, exception, context) =>
-                    {
-                        // Get the strategy relied on the exception type.
-                        IThrottlingStrategy strategy = ThrottlingStrategyFactory.GetStrategy(exception);
+            return Policy.Handle<ClientThrottleException>(clientThrottleException => clientThrottleException.RetryAfterInterval >= TimeSpan.Zero)
+                         .WaitAndRetryAsync(5,
+                                            (retryCount, exception, context) =>
+                                            {
+                                                if (exception is ClientThrottleException usedException)
+                                                {
+                                                    // Check if the waiting time is negative.
+                                                    if (usedException.RetryAfterInterval <= TimeSpan.Zero)
+                                                    {
+                                                        // Return a zero when it is negative.
+                                                        return TimeSpan.Zero;
+                                                    }
 
-                        // Retrieve retry after value as a TimeSpan from the chosen strategy.
-                        TimeSpan retryAfterTimeSpan = strategy.GetRetryAfterTimeSpan(exception);
-                        return retryAfterTimeSpan;
-                    },
-                    onRetry: (exception, timeSpan, retryCount, context) =>
-                    {
-                        Console.WriteLine("Let's retry it for the {0} time after waiting for {1}", retryCount,
-                            timeSpan.ToString());
-                    }
-                );
+                                                    // Return the waiting time from the exception as a TimeSpan.
+                                                    return usedException.RetryAfterInterval;
+                                                }
+
+                                                // Return a default waiting time of 60 seconds.
+                                                return TimeSpan.FromSeconds(60);
+                                            },
+                                            async (exception, timeSpan, retryCount, context) =>
+                                            {
+                                                Console.WriteLine("Let's retry it for the {0} time after waiting for {1}", retryCount, timeSpan.ToString());
+                                            });
         }
 
         /// <summary>
-        /// Login to DocuWare system and forces it to throttle
+        ///     Login to DocuWare system and forces it to throttle. Attention this is only for test purposes!
         /// </summary>
         /// <param name="serverAddress">The DocuWare server platform endpoint.</param>
         /// <param name="userName">The used DocuWare user.</param>
         /// <param name="userPassword">The user password.</param>
-        private static void loginDocuWareWithUserNameAndPassword(string serverAddress, string userName, string userPassword)
+        private static async Task loginDocuWareWithUserNameAndPassword(string serverAddress, string userName, string userPassword)
         {
-            for (int i = 0; i < 2000; i++)
+            var intList = Enumerable.Range(1, 80);
+
+            var options = new ParallelOptions
             {
-                // Open a connection to the DocuWare system
-                ServiceConnection serviceConnection = ServiceConnection.Create(new Uri(serverAddress),
-                    userName,
-                    userPassword);
+                MaxDegreeOfParallelism = 20
+            };
 
-                Console.WriteLine(string.Format("Iteration: {0} Organization count: {1}", i, serviceConnection.Organizations.Length));
+            await Parallel.ForEachAsync(intList,
+                                        options,
+                                        (i, cancellationToken) =>
+                                        {
+                                            var serviceConnection = ServiceConnection.Create(new Uri(serverAddress), userName, userPassword);
 
-                // Free used connection
-                serviceConnection.Disconnect();
-            }
+                                            Console.WriteLine("Iteration: {0} Organization count: {1}", i, serviceConnection.Organizations.Length);
+
+                                            return ValueTask.CompletedTask;
+                                        });
         }
     }
 }
